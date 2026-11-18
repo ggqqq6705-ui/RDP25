@@ -1,0 +1,163 @@
+
+name: Windows Server 2022 + Tailscale + RDP 60 FPS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Windows RDP
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop
+          $ts = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $tcp = "$ts\WinStations\RDP-Tcp"
+
+          Set-ItemProperty -Path $ts `
+            -Name fDenyTSConnections -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty -Path $tcp `
+            -Name UserAuthentication -Value 1
+
+          # Use TLS security
+          Set-ItemProperty -Path $tcp `
+            -Name SecurityLayer -Value 2
+
+          # Enable 60 FPS maximum frame rate
+          $ws = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+
+          New-ItemProperty -Path $ws `
+            -Name DWMFRAMEINTERVAL `
+            -PropertyType DWord -Value 15 -Force
+
+          # Disable broad default RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          # Allow RDP only from Tailscale IPv4 range
+          Remove-NetFirewallRule -DisplayName "RDP-Tailscale-TCP" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-TCP" `
+            -Direction Inbound -Action Allow `
+            -Protocol TCP -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-UDP" `
+            -Direction Inbound -Action Allow `
+            -Protocol UDP -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing"
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" `
+              -ErrorAction SilentlyContinue)) {
+
+            New-LocalUser -Name "RDP" `
+              -Password $securePass `
+              -PasswordNeverExpires
+          }
+          else {
+            Set-LocalUser -Name "RDP" `
+              -Password $securePass `
+              -PasswordNeverExpires $true
+          }
+
+          Enable-LocalUser -Name "RDP"
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+            $members = Get-LocalGroupMember -Group $group
+            if (-not ($members.Name -match "\\RDP$")) {
+              Add-LocalGroupMember -Group $group -Member "RDP"
+            }
+          }
+
+          Write-Host "RDP user configured."
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Verify RDP and Tailscale
+        shell: pwsh
+        run: |
+          $ts = Get-Command tailscale.exe `
+            -ErrorAction SilentlyContinue
+
+          if (-not $ts) {
+            $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          }
+          else {
+            $exe = $ts.Source
+          }
+
+          if (-not (Test-Path $exe)) {
+            throw "Tailscale executable not found"
+          }
+
+          $ip = (& $exe ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $ip) {
+            throw "Tailscale IP not assigned"
+          }
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 -Port 3389
+
+          if (-not $test.TcpTestSucceeded) {
+            throw "RDP port 3389 is not listening"
+          }
+
+          Write-Host "================================"
+          Write-Host "Windows Server 2022 RDP READY"
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "Username: .\RDP"
+          Write-Host "Port: 3389"
+          Write-Host "Target FPS: 60"
+          Write-Host "================================"
+
+          @"
+          ## RDP Connection
+          - Address: $ip
+          - Port: 3389
+          - Username: .\RDP
+          - Target: 60 FPS
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Keep RDP Alive
+        shell: pwsh
+        run: |
+          Write-Host "RDP is running."
+          Write-Host "Use Android to connect through Tailscale."
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active"
+            Start-Sleep -Seconds 240
+          }
